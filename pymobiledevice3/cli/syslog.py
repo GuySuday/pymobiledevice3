@@ -96,13 +96,73 @@ def format_line(
     return line
 
 
+def _should_skip_line(line: str, invert_match: list[str], invert_match_insensitive: list[str]) -> bool:
+    for m in invert_match:
+        if m in line:
+            return True
+
+    line_lower = line.lower()
+    return any(m.lower() in line_lower for m in invert_match_insensitive)
+
+
+def _should_keep_line(
+    line: str, match: list[str], match_insensitive: list[str], match_regex: list[re.Pattern[str]]
+) -> bool:
+    for m in match:
+        if m not in line:
+            return False
+
+    line_lower = line.lower()
+    if not all(m.lower() in line_lower for m in match_insensitive):
+        return False
+
+    if not match_regex:
+        return True
+
+    return any(regex.search(line) for regex in match_regex)
+
+
+def _highlight_match_filters(styled_line: str, match: list[str], match_insensitive: list[str]) -> str:
+    for m in match:
+        styled_line = styled_line.replace(m, typer.style(m, bold=True, underline=True))
+
+    for m in match_insensitive:
+        m = m.lower()
+        start = styled_line.lower().index(m)
+        end = start + len(m)
+        last_color_formatting = get_last_used_terminal_formatting(styled_line[:start])
+        styled_line = (
+            styled_line[:start]
+            + typer.style(styled_line[start:end], bold=True, underline=True)
+            + last_color_formatting
+            + styled_line[end:]
+        )
+
+    return styled_line
+
+
+def _highlight_regex_filters(styled_line: str, match_regex: list[re.Pattern[str]]) -> str:
+    def replace(m):
+        if len(m.groups()):
+            return styled_line.replace(m.group(1), typer.style(m.group(1), bold=True, underline=True))
+        return ""
+
+    for regex in match_regex:
+        if regex.search(styled_line):
+            styled_line = re.sub(regex, replace, styled_line)
+
+    return styled_line
+
+
 async def syslog_live(
     service_provider: LockdownServiceProvider,
     out: Optional[TextIO],
     pid: int,
     process_name: Optional[str],
     match: list[str],
+    invert_match: list[str],
     match_insensitive: list[str],
+    invert_match_insensitive: list[str],
     include_label: bool,
     regex: list[str],
     insensitive_regex: list[str],
@@ -116,75 +176,40 @@ async def syslog_live(
     if start_after is not None:
         print(f'Waiting for "{start_after}" ...', flush=True)
 
-    def replace(m):
-        if len(m.groups()) and line:
-            return line.replace(m.group(1), typer.style(m.group(1), bold=True, underline=True))
-        return ""
+    should_color_output = user_requested_colored_output()
 
     async for syslog_entry in OsTraceService(lockdown=service_provider).syslog(pid=pid):
         if process_name and posixpath.basename(syslog_entry.filename) != process_name:
             continue
 
-        line_no_style = format_line(False, pid, syslog_entry, include_label, image_offset)
-        line = format_line(user_requested_colored_output(), pid, syslog_entry, include_label, image_offset)
+        line = format_line(False, pid, syslog_entry, include_label, image_offset)
+        styled_line = format_line(should_color_output, pid, syslog_entry, include_label, image_offset)
 
-        if line_no_style is None or line is None:
+        if line is None or styled_line is None:
             continue
 
         if not started:
-            if start_after not in line_no_style:
+            if start_after not in line:
                 continue
             started = True
 
-        skip = False
-
-        if match is not None:
-            for m in match:
-                match_line = line
-                if m not in match_line:
-                    skip = True
-                    break
-                else:
-                    if user_requested_colored_output():
-                        match_line = match_line.replace(m, typer.style(m, bold=True, underline=True))
-                        line = match_line
-
-        if match_insensitive is not None:
-            for m in match_insensitive:
-                m = m.lower()
-                if m not in line.lower():
-                    skip = True
-                    break
-                else:
-                    if user_requested_colored_output():
-                        start = line.lower().index(m)
-                        end = start + len(m)
-                        last_color_formatting = get_last_used_terminal_formatting(line[:start])
-                        line = (
-                            line[:start]
-                            + typer.style(line[start:end], bold=True, underline=True)
-                            + last_color_formatting
-                            + line[end:]
-                        )
-
-        if match_regex:
-            skip = True
-            for r in match_regex:
-                if not r.findall(line_no_style):
-                    continue
-                line = re.sub(r, replace, line)
-                skip = False
-
-        if skip:
+        if _should_skip_line(line, invert_match, invert_match_insensitive):
             continue
 
-        print(line, flush=True)
+        if not _should_keep_line(line, match, match_insensitive, match_regex):
+            continue
+
+        if should_color_output:
+            styled_line = _highlight_match_filters(styled_line, match, match_insensitive)
+            styled_line = _highlight_regex_filters(styled_line, match_regex)
+
+        print(styled_line, flush=True)
 
         if out:
-            if user_requested_colored_output():
-                print(line, file=out, flush=True)
+            if should_color_output:
+                print(styled_line, file=out, flush=True)
             else:
-                print(line_no_style, file=out, flush=True)
+                print(line, file=out, flush=True)
 
 
 @cli.command("live")
@@ -216,7 +241,15 @@ async def cli_syslog_live(
         typer.Option(
             "--match",
             "-m",
-            help="match expression",
+            help="filter only logs matching this expression (repeatable; all must match - conjunction)",
+        ),
+    ] = None,
+    invert_match: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--invert-match",
+            "-v",
+            help="filter only logs not matching this expression (repeatable; any match excludes - disjunction)",
         ),
     ] = None,
     match_insensitive: Annotated[
@@ -224,7 +257,17 @@ async def cli_syslog_live(
         typer.Option(
             "--match-insensitive",
             "-mi",
-            help="case-insensitive match expression",
+            help="filter only logs matching this expression, case-insensitively "
+            "(repeatable; all must match - conjunction)",
+        ),
+    ] = None,
+    invert_match_insensitive: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--invert-match-insensitive",
+            "-vi",
+            help="filter only logs not matching this expression, case-insensitively "
+            "(repeatable; any match excludes - disjunction)",
         ),
     ] = None,
     include_label: Annotated[
@@ -239,7 +282,7 @@ async def cli_syslog_live(
         typer.Option(
             "--regex",
             "-e",
-            help="filter only lines matching given regex",
+            help="filter only lines matching given regex (repeatable; any match includes - disjunction)",
         ),
     ] = None,
     insensitive_regex: Annotated[
@@ -247,7 +290,8 @@ async def cli_syslog_live(
         typer.Option(
             "--insensitive-regex",
             "-ei",
-            help="filter only lines matching given regex (insensitive)",
+            help="filter only lines matching given regex, case-insensitively "
+            "(repeatable; any match includes - disjunction)",
         ),
     ] = None,
     image_offset: Annotated[
@@ -275,7 +319,9 @@ async def cli_syslog_live(
             pid,
             process_name,
             match or [],
+            invert_match or [],
             match_insensitive or [],
+            invert_match_insensitive or [],
             include_label,
             regex or [],
             insensitive_regex or [],

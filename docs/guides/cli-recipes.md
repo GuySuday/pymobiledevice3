@@ -24,6 +24,9 @@ pymobiledevice3 syslog live
 # Filter syslog lines
 pymobiledevice3 syslog live -m SpringBoard
 
+# Exclude syslog lines
+pymobiledevice3 syslog live -v unwanted_log
+
 # Restart device
 pymobiledevice3 diagnostics restart
 

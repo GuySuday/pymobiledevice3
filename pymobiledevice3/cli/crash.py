@@ -56,7 +56,7 @@ async def crash_parse_latest(
         typer.Option(
             "--match",
             "-m",
-            help="Case-sensitive basename regex filter (repeatable; all must match)",
+            help="Case-sensitive basename regex filter (repeatable; all must match - conjunction)",
         ),
     ] = None,
     match_insensitive: Annotated[
@@ -64,7 +64,7 @@ async def crash_parse_latest(
         typer.Option(
             "--match-insensitive",
             "-mi",
-            help="Case-insensitive basename regex filter (repeatable; all must match)",
+            help="Case-insensitive basename regex filter (repeatable; all must match - conjunction)",
         ),
     ] = None,
     count: Annotated[
